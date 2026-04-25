@@ -67,14 +67,20 @@ quietly() {
 
 # --- argument parsing --------------------------------------------------------
 MODE=install
+SKIP_APT=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --uninstall)  MODE=uninstall ;;
         --verbose|-v) VERBOSE=1 ;;
+        --skip-apt)   SKIP_APT=1 ;;
         -h|--help)
             cat <<H
-Usage: $0 [--verbose|-v] [--uninstall]
+Usage: $0 [--verbose|-v] [--skip-apt] [--uninstall]
   --verbose   stream every step's output (default: quiet, dump on error only)
+  --skip-apt  do not run apt-get; assume required packages are already
+              installed (recommended for clustered hosts running GFS/OCFS2/
+              corosync/pacemaker — avoids needrestart-induced service
+              restarts that can break cluster quorum mid-deploy)
   --uninstall remove the service, files, and firewall rules
 H
             exit 0 ;;
@@ -114,15 +120,45 @@ step_preflight() {
     fi
     command -v apt-get >/dev/null 2>&1 \
         || { echo "apt-get not found — Debian/Ubuntu required."; return 1; }
+    # When --skip-apt is set, verify the binaries we depend on are already present
+    if (( SKIP_APT )); then
+        local missing=()
+        for cmd in htop python3 curl tar logrotate ss; do
+            command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+        done
+        if (( ${#missing[@]} > 0 )); then
+            echo "--skip-apt set but these required binaries are missing: ${missing[*]}"
+            echo "Pre-stage them with apt during a maintenance window, then re-run."
+            return 1
+        fi
+    fi
 }
 
 step_apt() {
+    # Suppress every Debian-policy mechanism that can decide to restart
+    # services or reboot the host on our behalf during a mass deploy.
     export DEBIAN_FRONTEND=noninteractive
+    export NEEDRESTART_MODE=l        # list only — don't restart anything
+    export NEEDRESTART_SUSPEND=1     # newer needrestart honors this to skip entirely
+    export DEBIAN_PRIORITY=critical  # only show critical debconf prompts
+    # And keep existing config files instead of prompting/replacing
+    local APT_OPTS=(
+        -yqq
+        -o Dpkg::Options::=--force-confdef
+        -o Dpkg::Options::=--force-confold
+    )
     apt-get update -qq
-    apt-get install -yqq \
+    apt-get install "${APT_OPTS[@]}" \
         htop python3 python3-venv python3-pip python3-dev \
         libpam0g-dev build-essential logrotate \
         iproute2 procps util-linux curl ca-certificates
+
+    # If the kernel was already flagged as needing a reboot before we ran,
+    # surface that to the operator (visible only in --verbose / failure dump).
+    if [[ -f /var/run/reboot-required ]]; then
+        echo "note: /var/run/reboot-required is set on this host"
+        cat /var/run/reboot-required.pkgs 2>/dev/null | sed 's/^/  /' || true
+    fi
 }
 
 step_dirs() {
@@ -1744,7 +1780,12 @@ detect_port() {
 printf "\n%sR369 System Monitor%s — installing…\n\n" "$C_BLU" "$C_OFF"
 
 quietly "Pre-flight checks"                    step_preflight
-quietly "Installing OS packages"               step_apt
+if (( SKIP_APT )); then
+    printf "  %-50s%s[skip]%s --skip-apt\n" \
+        "Installing OS packages" "$C_DIM" "$C_OFF"
+else
+    quietly "Installing OS packages"           step_apt
+fi
 quietly "Creating ${R369_DIR}"                 step_dirs
 quietly "Caching xterm.js assets (npm)"        step_xterm
 quietly "Setting up Python environment"        step_python
